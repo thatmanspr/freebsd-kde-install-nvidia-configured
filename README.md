@@ -69,6 +69,37 @@ can fall back to the wrong driver or panic during device open. The fix is a mini
 - Installs the full NVIDIA package set: `nvidia-driver`, `nvidia-kmod`, `nvidia-drm-kmod`,
   `nvidia-settings`, `nvidia-xconfig`, `nvidia-texture-tools`, `linux-nvidia-libs`, `linux-nvidia-libs32`
 
+  ## mdo — Sudo Replacement
+
+The script optionally configures `mdo`, FreeBSD's native privilege escalation
+tool built on the `mac_do` MAC framework. It replaces sudo with no extra
+packages required.
+
+When enabled, wheel group members can run:
+
+```sh
+mdo pkg install vim
+mdo service sddm restart
+```
+
+### What the script does
+
+- Loads `mac_do` immediately (no reboot needed to use it right away)
+- Adds `mac_do_load="YES"` to `/boot/loader.conf` for persistence
+- Writes the correct rule to `/etc/sysctl.conf` **without quotes**:
+
+- security.mac.do.rules=gid=0>uid=0,gid=,+gid=
+
+- - Adds selected users to the `wheel` group
+
+### Why the rule looks like that
+
+The bare rule `gid=0>uid=0` is silently rejected by `mac_do` on FreeBSD 15 —
+you need to also specify target group permissions with `gid=*,+gid=*`.
+Wrapping the value in quotes in `sysctl.conf` also breaks it on boot (the
+quotes become part of the value). Both mistakes result in
+`mdo: setcred(): Operation not permitted` even after a reboot.
+
 ### Added Packages (installed by default)
 
 | Package | Why |
