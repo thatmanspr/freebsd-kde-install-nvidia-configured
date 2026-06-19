@@ -1,0 +1,562 @@
+#!/bin/sh
+#-
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Based on kde-installer-dialogs by Alfonso Sabato Siciliano
+# (FreeBSD Foundation). Modified for NVIDIA-first setups:
+#   - Correct NVIDIA module names (nvidia + nvidia-modeset, not nvidia-drm)
+#   - loader.conf entries written before rc.conf kld_list
+#   - linux_enable=YES always set for NVIDIA (needed for linux-nvidia-libs)
+#   - linux64 kld loaded at install time to prevent mid-install panics
+#   - Xorg Device section written for nvidia driver
+#   - Alacritty replaces Konsole as default terminal
+#   - Fish set as default shell for selected users
+#   - firefox-esr and fastfetch installed by default
+#   - Alacritty and fish themed out of the box
+#
+
+BSDCFG_SHARE="/usr/share/bsdconfig"
+. $BSDCFG_SHARE/common.subr || exit 1
+
+: ${BSDDIALOG_OK=0}
+: ${BSDDIALOG_YES=$BSDDIALOG_OK}
+: ${BSDDIALOG_NO=1}
+
+XDRIVERFILE=/usr/local/etc/X11/xorg.conf.d/20-generic-driver.conf
+NVIDIAFILE=/etc/X11/xorg.conf.d/20-nvidia.conf
+BOOTMETHOD=`sysctl -n machdep.bootmethod`
+USERS=`pw usershow -a | awk -F":" '$NF != "/usr/sbin/nologin" && $3 > 999 {print $1 " \""$8"\" on"}' | sort`
+VM=`sysctl -n kern.vm_guest`
+ARCH=`uname -p`
+VERSION=`uname -r | cut -d- -f2-`
+
+####
+# 1. Yes-No question and checks.
+# 2. Select GPU driver.
+# 3. Select display manager.
+# 4. Installation.
+# 5. Global configuration.
+# 6. Configuration for users (shell, terminal, theming).
+# 7. Success message.
+####
+
+#### SECTION 1: Yes-No question and Checks ####
+question="FreeBSD provides a variety of graphical environments that can
+be easily installed through ports and packages. Refer to the FreeBSD Handbook
+available at \Zuhttps://docs.freebsd.org\Zn.\n\nWould you like to install the
+GPU drivers, Xorg, KDE Plasma, and a display manager now, and have them start
+automatically at the next system reboot?\n\nThis script also installs:
+  - Alacritty (terminal), Fish shell, Firefox ESR, Fastfetch
+  - Correct NVIDIA kernel module configuration to prevent boot panics\n\nPlease note this is an experimental feature."
+
+if [ $VERSION = CURRENT ]; then
+	question="$question You are installing FreeBSD CURRENT, the development
+version of the system, so unexpected results or errors may occur now or after
+installation."
+fi
+
+bsddialog --backtitle "$OSNAME Installer" --title Desktop --colors \
+	--yesno "$question" 0 0
+[ $? -ne $BSDDIALOG_YES ] && exit 1
+
+if [ -z "`hostname`" ]; then
+	bsddialog --backtitle "$OSNAME Installer" --title Desktop \
+	--ok-label Exit --msgbox "Please set a hostname." 0 0
+	exit 1
+fi
+
+if [ -z "$USERS" ]; then
+	bsddialog --backtitle "$OSNAME Installer" --title Desktop \
+	--ok-label Exit \
+	--msgbox "No created user accounts were found on this system.
+Although it is possible to run a graphical environment as the root user,
+it is strongly discouraged for security reasons.\n\n
+Please create at least one regular user account before launching this module
+to install a graphical desktop environment." \
+	0 0
+	exit 1
+fi
+
+#### SECTION 2: Select GPU ####
+PKGGPU=`fwget -n -q | grep gpu`
+GPU=`pciconf -lv | grep -A 4 vga`
+HELPGPU="\ZbSystem firmware boot method\ZB: $BOOTMETHOD
+\ZbGPU\ZB: $GPU
+\ZbDetected firmware package\ZB: $PKGGPU"
+
+if [ $ARCH != amd64 -a $ARCH != aarch64 -a $ARCH != armv7 ]; then
+	bsddialog --backtitle "$OSNAME Installer" --title Desktop \
+		--ok-label Exit \
+		--msgbox "Sorry no GPU driver for the $ARCH architecture." 0 0
+	exit 1
+elif [ $ARCH = aarch64 -o $ARCH = armv7 ]; then
+	[ $BOOTMETHOD == BIOS ] && defaultgpu=VESA || defaultgpu=SCFB
+	msggpu="Select \Zb$defaultgpu\ZB because it is the only driver\
+	supported with $ARCH and $BOOTMETHOD."
+elif [ $VM = vbox -a $VERSION = CURRENT ]; then
+	msggpu="Detected $OSNAME CURRENT in a VirtualBox virtual machine."
+	[ $BOOTMETHOD == BIOS ] && defaultgpu=VESA || defaultgpu=SCFB
+	msggpu="$msggpu Select \Zb$defaultgpu\ZB to avoid a possible kernel panic."
+elif [ $VM = vbox ]; then
+	defaultgpu=VirtualBox
+	msggpu="Autodetected \ZbVirtualBox\ZB virtual machine,"
+elif [ $VM = vmware ]; then
+	defaultgpu=VMware
+	msggpu="Autodetected \ZbVMware\ZB virtual machine,"
+elif [ "${GPU#*NVIDIA}" != "$GPU" -a "${PKGGPU#*intel}" != "$PKGGPU" ]; then
+	defaultgpu=Optimus
+	msggpu="Autodetected a NVIDIA GPU and an Intel GPU, probably \ZbOptimus\ZB,"
+elif [ "${GPU#*NVIDIA}" != "$GPU" ]; then
+	defaultgpu=NVIDIA
+	msggpu="Autodetected a \ZbNVIDIA\ZB GPU,"
+elif [ "${PKGGPU#*intel}" != "$PKGGPU" ]; then
+	defaultgpu=Intel
+	msggpu="Autodetected an \ZbIntel\ZB GPU,"
+elif [ "${PKGGPU#*amd}" != "$PKGGPU" ]; then
+	defaultgpu=AMD
+	msggpu="Autodetected an \ZbAMD\ZB GPU"
+elif [ "${PKGGPU#*radeon}" != "$PKGGPU" ]; then
+	defaultgpu=Radeon
+	msggpu="Autodetected a \ZbRadeon\ZB GPU,"
+else
+	msggpu="No graphics driver was detected for your GPU,"
+	[ $BOOTMETHOD == BIOS ] && defaultgpu=VESA || defaultgpu=SCFB
+	msggpu="$msggpu select \Zb$defaultgpu\ZB because your system uses $BOOTMETHOD."
+fi
+
+exec 5>&1
+gpu=$(bsddialog --backtitle "$OSNAME Installer" --title Desktop \
+	--ok-label Select --default-item $defaultgpu \
+	--colors --hmsg "$HELPGPU" --item-depth \
+	--menu "Select your graphics card.\n$msggpu F1 to know more." \
+	0 0 0 \
+	0 DRM        "Intel and AMD Metaport" \
+	2 Intel      "Intel APUs starting with HD3000 / Sandy Bridge" \
+	2 AMD        "AMD GPUs starting with HD7000 / Tahiti" \
+	2 Radeon     "Older AMD GPUs (EFI boot should be disabled)" \
+	0 NVIDIA     "Proprietary driver" \
+	2 Optimus    "Nvidia Optimus and Intel GPU" \
+	0 VirtualBox "Oracle VirtualBox virtual machine" \
+	0 VMware     "Broadcom virtual machine" \
+	0 VESA       "GPU not supported by other drivers (BIOS)" \
+	0 SCFB       "GPU not supported by other drivers (UEFI)" \
+	2>&1 1>&5)
+retval=$?
+exec 5>&-
+[ $retval -ne $BSDDIALOG_OK ] && exit 1
+
+toinstall=""
+gpuconfig=""
+optimus=0
+
+case $gpu in
+	DRM)
+		toinstall="drm-kmod mesa-gallium-va libva-utils libva-intel-media-driver"
+		gpuconfig="sysrc kld_list+=\"i915kms amdgpu radeonkms\""
+		;;
+	Optimus)
+		optimus=1
+		;&
+	Intel)
+		toinstall="drm-kmod mesa-gallium-va libva-utils libva-intel-media-driver"
+		gpuconfig="sysrc kld_list+=\"i915kms\""
+		;;
+	AMD)
+		toinstall="drm-kmod mesa-gallium-va libva-utils"
+		gpuconfig="sysrc kld_list+=\"amdgpu\""
+		;;
+	Radeon)
+		toinstall="drm-kmod mesa-gallium-va libva-utils"
+		gpuconfig="sysrc kld_list+=\"radeonkms\""
+		;;
+	VirtualBox)
+		toinstall="virtualbox-ose-additions-72"
+		gpuconfig="sysrc vboxguest_enable=\"YES\" ; sysrc vboxservice_enable=\"YES\""
+		;;
+	VMware)
+		toinstall="xf86-video-vmware xf86-input-vmmouse open-vm-tools"
+		gpuconfig="sysrc kld_list+=\"fusefs\""
+		;;
+	VESA)
+		toinstall="xf86-video-vesa"
+		gpuconfig="printf 'Section \"Device\"\n\tIdentifier \"Card0\"\n\tDriver \"vesa\"\nEndSection' > $XDRIVERFILE"
+		;;
+	SCFB)
+		toinstall="xf86-video-scfb"
+		gpuconfig="printf 'Section \"Device\"\n\tIdentifier \"Card0\"\n\tDriver \"scfb\"\nEndSection' > $XDRIVERFILE"
+		;;
+esac
+
+HELPGPU="$HELPGPU
+
+\ZbNVIDIA driver and supported GPUs\ZB:
+ * nvidia-drm-kmod (580+): \Zuhttps://www.nvidia.com/en-us/drivers/details/210651/\Zn
+ * nvidia-driver-470: \Zuhttps://www.nvidia.com/en-us/drivers/details/194639/\Zn
+ * nvidia-driver-390: \Zuhttps://www.nvidia.com/en-us/drivers/details/191122/\Zn"
+
+if [ $gpu = NVIDIA -o $optimus -eq 1 ]; then
+	items="nvidia-drm-kmod 'Proprietary driver version 580+ for recent GPUs (RTX 30/40 series)' \
+nvidia-driver-470 'Old proprietary driver version 470' \
+nvidia-driver-390 'Old proprietary driver version 390' \
+nvidia-driver-340 'Old proprietary driver version 340' \
+nvidia-driver-304 'Old proprietary driver version 304'"
+
+	exec 5>&1
+	nvdriver=$(echo $items | xargs -o bsddialog --backtitle "$OSNAME Installer" \
+		--title Desktop --ok-label Select --colors --hmsg "$HELPGPU" \
+		--menu "F1 to know your GPU and which driver supports it." \
+		0 0 0 \
+		2>&1 1>&5)
+	retval=$?
+	exec 5>&-
+	[ $retval -ne $BSDDIALOG_OK ] && exit 1
+
+	toinstall="$toinstall $nvdriver"
+
+	# --- NVIDIA FIX: correct module names and loader.conf entries ---
+	# The original script used kld_list="nvidia-drm" which is WRONG.
+	# FreeBSD requires: loader.conf loads nvidia + nvidia-modeset,
+	# and rc.conf kld_list uses those same names (not nvidia-drm).
+	# linux_enable is always set because linux-nvidia-libs requires it,
+	# and we load linux64 now to prevent panics during installation.
+
+	version=${nvdriver##nvidia-driver-}
+	case $version in
+		"nvidia-drm-kmod")
+			# Always install extras for RTX cards - needed for Wayland/RPC etc
+			toinstall="$toinstall nvidia-driver nvidia-kmod nvidia-drm-kmod"
+			toinstall="$toinstall nvidia-settings nvidia-xconfig nvidia-texture-tools"
+			toinstall="$toinstall linux-nvidia-libs linux-nvidia-libs32"
+
+			# loader.conf: load modules early at boot
+			gpuconfig="${gpuconfig:+\"$gpuconfig ; \"}"
+			gpuconfig="$gpuconfig"'echo "nvidia_load=\"YES\"" >> /boot/loader.conf'
+			gpuconfig="$gpuconfig"' ; echo "nvidia-modeset_load=\"YES\"" >> /boot/loader.conf'
+			gpuconfig="$gpuconfig"' ; echo "hw.nvidiadrm.modeset=1" >> /boot/loader.conf'
+
+			# rc.conf: correct module names (NOT nvidia-drm - that is wrong)
+			gpuconfig="$gpuconfig ; sysrc kld_list+=\"nvidia nvidia-modeset\""
+
+			# Linux compat always needed for linux-nvidia-libs
+			gpuconfig="$gpuconfig ; sysrc linux_enable=\"YES\""
+
+			# Xorg: explicit nvidia driver config to prevent fallback panics
+			gpuconfig="$gpuconfig ; mkdir -p /etc/X11/xorg.conf.d"
+			gpuconfig="$gpuconfig ; printf 'Section \"Device\"\n    Identifier \"NVIDIA Card\"\n    Driver \"nvidia\"\nEndSection\n' > $NVIDIAFILE"
+			;;
+		470 | 390)
+			gpuconfig="${gpuconfig:+\"$gpuconfig ; \"}"
+			gpuconfig="$gpuconfig"' echo "nvidia-modeset_load=\"YES\"" >> /boot/loader.conf'
+			gpuconfig="$gpuconfig ; sysrc kld_list+=\"nvidia-modeset\""
+			gpuconfig="$gpuconfig ; sysrc linux_enable=\"YES\""
+			;;
+		340 | 304)
+			gpuconfig="${gpuconfig:+\"$gpuconfig ; \"}"
+			gpuconfig="$gpuconfig"' echo "nvidia_load=\"YES\"" >> /boot/loader.conf'
+			gpuconfig="$gpuconfig ; sysrc kld_list+=\"nvidia\""
+			;;
+	esac
+fi
+
+#### SECTION 3: Display Manager ####
+exec 5>&1
+displaymgr=$(bsddialog --backtitle "$OSNAME Installer" --title Desktop \
+	--ok-label Select --default-item SDDM \
+	--menu "Select the display manager:" \
+	0 0 0 \
+	SDDM	"Graphical display manager (recommended)" \
+	Ly	"Text User Interface display manager" \
+	2>&1 1>&5)
+retval=$?
+exec 5>&-
+[ $retval -ne $BSDDIALOG_OK ] && exit 1
+
+LYINI="allow_empty_password = true
+animation = none
+asterisk = *
+auth_fails = 10
+bg = 0x00000000
+fg = 0x0002
+hide_version_string = true
+initial_info_text = Welcome to FreeBSD
+input_len = 34
+lang = en
+restart_cmd = /sbin/shutdown -r now
+shutdown_cmd = /sbin/shutdown -p now
+text_in_center = true
+waylandsessions = /usr/local/share/wayland-sessions
+x_cmd = /usr/local/bin/X
+xauth_cmd = /usr/local/bin/xauth
+xsessions = /usr/local/share/xsessions"
+
+LYGETTYTAB='# Ly manager
+Ly:\
+:lo=/usr/local/bin/ly_wrapper:\
+:al=root:'
+
+case $displaymgr in
+	SDDM)
+		toinstall="$toinstall sddm"
+		dmgrconfig="sysrc sddm_enable=\"YES\""
+		;;
+	Ly)
+		toinstall="$toinstall ly"
+		dmgrconfig="sed -i '' -e 's|ttyv1.*getty Pc.*|ttyv1 \"/usr/libexec/getty Ly\" xterm on secure|' /etc/ttys"
+		dmgrconfig="$dmgrconfig ; echo \"$LYINI\" > /usr/local/etc/ly/config.ini"
+		dmgrconfig="$dmgrconfig ; echo '$LYGETTYTAB' >> /etc/gettytab"
+		;;
+esac
+
+#### SECTION 4: Installation ####
+
+# Load linux64 NOW before installing NVIDIA packages to avoid
+# "linux64 module not found" errors mid-installation
+if [ $gpu = NVIDIA -o $optimus -eq 1 ]; then
+	bsddialog --backtitle "$OSNAME Installer" --title Desktop \
+		--infobox "Loading Linux compatibility modules required for NVIDIA..." 0 0
+	kldload linux 2>/dev/null
+	kldload linux64 2>/dev/null
+fi
+
+ASSUME_ALWAYS_YES=yes pkg update
+
+# Core packages: KDE + extras from this script
+EXTRA_PKGS="alacritty fish firefox-esr fastfetch"
+
+exec 5>&1
+pkgerr=$(pkg install $toinstall kde plasma6-plasma wireplumber xorg $EXTRA_PKGS 2>&1 1>&5)
+retval=$?
+exec 5>&-
+if [ $retval -ne 0 ]; then
+	bsddialog --backtitle "$OSNAME Installer" --title Desktop \
+	--msgbox "Error during package installation. Packages may currently be
+building, this is a common issue, try installing again later.\n\nReported error,
+$pkgerr" \
+	0 0
+	exit 1
+fi
+
+#### SECTION 5: Global Configuration ####
+bsddialog --backtitle "$OSNAME Installer" --title Desktop \
+	--infobox "Creating and updating configuration files..." 0 0
+
+# Clean previous/conflicting configs
+sysrc -= "i915kms amdgpu radeonkms nvidia-drm nvidia-modeset nvidia fusefs"
+rm -f $XDRIVERFILE
+sed -i '' '/hw.nvidiadrm.modeset/d' /boot/loader.conf
+sed -i '' '/nvidia_load/d' /boot/loader.conf
+sed -i '' '/nvidia-modeset_load/d' /boot/loader.conf
+sed -i '' '/# VirtualBox setup/d' /boot/loader.conf
+sed -i '' '/hw.efi.poweroff=0/d' /boot/loader.conf
+sed -i '' '/sddm_enable="YES"/d' /etc/rc.conf
+sed -i '' '/^# Ly manager/,+3d' /etc/gettytab
+cp /usr/local/etc/ly/config.ini.sample /usr/local/etc/ly/config.ini 2>/dev/null
+sed -i '' -e 's|ttyv1.*getty Ly.*|ttyv1\t"/usr/libexec/getty Pc"\t\txterm\tonifexists secure|' /etc/ttys
+
+eval $gpuconfig
+sysrc dbus_enable="YES"
+eval "$dmgrconfig"
+
+grep -qxF "# KDE setup" /etc/sysctl.conf || {
+	echo "# KDE setup"
+	echo "net.local.stream.recvspace=65536"
+	echo "net.local.stream.sendspace=65536"
+} >> /etc/sysctl.conf
+
+if [ $gpu = VirtualBox -a $BOOTMETHOD = UEFI ]; then
+	{
+		echo "# VirtualBox setup"
+		echo "hw.efi.poweroff=0"
+	} >> /boot/loader.conf
+fi
+
+#### SECTION 6: User Configuration ####
+exec 5>&1
+users=$(echo ${USERS} | xargs -o bsddialog --backtitle "$OSNAME Installer" \
+	--title Desktop --ok-label Continue \
+	--checklist "SPACE to select users to configure:" \
+	0 0 0 \
+	2>&1 1>&5)
+retval=$?
+exec 5>&-
+[ $retval -ne $BSDDIALOG_OK ] && exit 1
+
+if [ $gpu != VESA -a $gpu != SCFB -a $gpu != VirtualBox ]; then
+	pw groupmod video -m `echo "$users" | tr ' ' ','`
+fi
+
+if [ $gpu = VirtualBox ]; then
+	pw groupmod wheel -m `echo "$users" | tr ' ' ','`
+fi
+
+gen_autostart_entry() {
+	cat <<EOF
+[Desktop Entry]
+Name=$1
+Comment=$2
+Exec=$3
+Terminal=false
+Type=Application
+X-GNOME-Autostart-Phase=Initialization
+X-KDE-autostart-phase=1
+Version=1.0
+$4
+EOF
+}
+
+FISH_BIN=/usr/local/bin/fish
+ALACRITTY_BIN=/usr/local/bin/alacritty
+
+for u in $users; do
+	user_home="$(pw usershow ${u} | awk -F: '{print $(NF-1)}')"
+	user_config_dir="${user_home}/.config"
+	mkdir -p "${user_config_dir}/autostart"
+	mkdir -p "${user_config_dir}/alacritty"
+	mkdir -p "${user_home}/.config/fish"
+
+	# PipeWire autostart
+	gen_autostart_entry \
+		'PipeWire Media System' \
+		'Start the PipeWire Media System' \
+		pipewire > "${user_config_dir}/autostart/pipewire.desktop"
+	gen_autostart_entry \
+		'PipeWire PulseAudio replacement' \
+		'Start the PulseAudio-compatible PipeWire daemon' \
+		pipewire-pulse > "${user_config_dir}/autostart/pipewire-pulse.desktop"
+	gen_autostart_entry \
+		'PulseAudio Sound System' \
+		'Start the PulseAudio Sound System' \
+		'start-pulseaudio-x11' \
+		'Hidden=true' > "${user_config_dir}/autostart/pulseaudio.desktop"
+
+	# Set fish as default shell
+	if [ -x "$FISH_BIN" ]; then
+		chsh -s "$FISH_BIN" "$u"
+		grep -qF "$FISH_BIN" /etc/shells || echo "$FISH_BIN" >> /etc/shells
+	fi
+
+	# Alacritty config with a clean dark theme
+	cat > "${user_config_dir}/alacritty/alacritty.toml" << 'ALACRITTY_CONF'
+[window]
+padding = { x = 12, y = 10 }
+decorations = "full"
+opacity = 0.95
+blur = true
+
+[font]
+normal = { family = "monospace", style = "Regular" }
+size = 12.0
+
+[colors.primary]
+background = "#1e1e2e"
+foreground = "#cdd6f4"
+
+[colors.cursor]
+text = "#1e1e2e"
+cursor = "#f5e0dc"
+
+[colors.normal]
+black   = "#45475a"
+red     = "#f38ba8"
+green   = "#a6e3a1"
+yellow  = "#f9e2af"
+blue    = "#89b4fa"
+magenta = "#f5c2e7"
+cyan    = "#94e2d5"
+white   = "#bac2de"
+
+[colors.bright]
+black   = "#585b70"
+red     = "#f38ba8"
+green   = "#a6e3a1"
+yellow  = "#f9e2af"
+blue    = "#89b4fa"
+magenta = "#f5c2e7"
+cyan    = "#94e2d5"
+white   = "#a6adc8"
+
+[cursor]
+style = { shape = "Block", blinking = "On" }
+blink_interval = 500
+
+[scrolling]
+history = 10000
+ALACRITTY_CONF
+
+	# Fish config with a clean prompt and fastfetch on launch
+	cat > "${user_home}/.config/fish/config.fish" << 'FISH_CONF'
+# Greeting: show fastfetch on new terminals
+if status is-interactive
+    if type -q fastfetch
+        fastfetch
+    end
+end
+
+# Clean, minimal prompt
+function fish_prompt
+    set -l last_status $status
+    set -l cwd (prompt_pwd)
+
+    if test $last_status -ne 0
+        set prompt_color red
+    else
+        set prompt_color blue
+    end
+
+    echo -n (set_color $prompt_color)"❯ "(set_color cyan)$cwd(set_color normal)" "
+end
+
+function fish_right_prompt
+    echo -n (set_color brblack)(date "+%H:%M")(set_color normal)
+end
+
+# Aliases
+alias ll='ls -lah'
+alias la='ls -A'
+alias ..='cd ..'
+alias mdo='mdo'
+
+# Set alacritty as default terminal for file managers etc
+set -gx TERMINAL alacritty
+set -gx EDITOR nvim
+FISH_CONF
+
+	chown -R ${u}:${u} "${user_config_dir}"
+	chown ${u}:${u} "${user_home}/.config/fish/config.fish"
+done
+
+# Set KDE default terminal to Alacritty
+for u in $users; do
+	user_home="$(pw usershow ${u} | awk -F: '{print $(NF-1)}')"
+	mkdir -p "${user_home}/.config"
+	# KDE konsole -> alacritty override
+	cat > "${user_home}/.config/kdeglobals" << 'KDEGLOBALS'
+[General]
+TerminalApplication=alacritty
+TerminalService=
+KDEGLOBALS
+	chown ${u}:${u} "${user_home}/.config/kdeglobals"
+done
+
+#### SECTION 7: Success ####
+users=`echo "$users" | sed 's/ /, /g'`
+
+finalmsg="Desktop installation completed.\n\n
+The ${displaymgr} display manager will start at next boot.
+Configured users: \Zb${users}\ZB.\n\n
+\ZbInstalled extras:\ZB
+  - Alacritty terminal (themed with Catppuccin Mocha)
+  - Fish shell (set as default, with fastfetch on launch)
+  - Firefox ESR
+  - Fastfetch\n"
+
+if [ $gpu = NVIDIA -o $optimus -eq 1 ]; then
+	finalmsg="$finalmsg
+\ZbNVIDIA notes:\ZB
+  - Modules: nvidia + nvidia-modeset loaded via /boot/loader.conf
+  - Xorg configured at /etc/X11/xorg.conf.d/20-nvidia.conf
+  - Linux compat enabled (required for linux-nvidia-libs)"
+fi
+
+bsddialog --backtitle "$OSNAME Installer" --title Desktop --colors \
+	--msgbox "$finalmsg" 0 0
