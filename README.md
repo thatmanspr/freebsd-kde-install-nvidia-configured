@@ -1,4 +1,4 @@
-# kde-install-nvidia-configured
+# freebsd-kde-install-nvidia-configured
 
 A modified FreeBSD KDE Plasma installer script, forked from
 [kde-installer-dialogs](https://gitlab.com/alfix/kde-installer-dialogs)
